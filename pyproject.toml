@@ -5,8 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+<<<<<<< HEAD
     "ipdb>=0.13.13",
     "pydantic>=2.11.7",
     "pytest>=8.4.1",
+=======
+>>>>>>> d745ea2 (chore: initial commit)
     "ty>=0.0.1a14",
 ]
