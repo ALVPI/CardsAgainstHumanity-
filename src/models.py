@@ -1,8 +1,9 @@
 import random
+import time
 from enum import Enum, auto
 from html import unescape
-from typing import Annotated, TypeVar
-from uuid import uuid4
+from typing import Annotated, Any, TypeVar
+from uuid import UUID, uuid4
 
 from pydantic import AfterValidator, BaseModel, BeforeValidator, Field
 from pydantic.types import UUID4
@@ -12,6 +13,18 @@ class CAHDrawingListEmpty(Exception): ...
 
 
 T = TypeVar("T")
+
+
+class MessageType(str, Enum):
+    GET_GAME_STATE = auto()
+    SET_PLAYER_INFO = auto()
+    ACK = auto()
+    DISCONNECT = auto()
+
+
+class Message(BaseModel):
+    type: MessageType
+    data: Any
 
 
 class PlayerRole(str, Enum):
@@ -96,6 +109,25 @@ class Deck(BaseModel):
         )
 
 
+class GameSettings(BaseModel):
+    """
+    - Deck (show all available decks with info card count) = ES
+    - Max player count = 10
+    - Max hand size (white cards) = 5
+    - Max round time = 30s
+    - Max rounds = 3
+    - Max winning score = 5 NICE TO HAVE
+    - Random seed
+    """
+
+    deck: Deck
+    max_player_count: int = 10
+    max_hand_size: int = 5
+    max_round_time: int = 30
+    max_rounds: int = 3
+    random_seed: int = int(time.time())
+
+
 class Phase(str, Enum):
     SETUP = auto()
     PLAY_CARDS = auto()
@@ -103,6 +135,7 @@ class Phase(str, Enum):
 
 
 class GameState(BaseModel):
-    phase: Phase
-    players: list[Player]
-    black_card: BlackCard
+    settings: GameSettings
+    phase: Phase = Phase.SETUP
+    black_card: BlackCard | None = None
+    players: dict[UUID, Player] = Field(default_factory=dict)

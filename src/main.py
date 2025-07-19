@@ -1,115 +1,33 @@
-import logging
+import asyncio
 import random
+import sys
 from collections import defaultdict
 from copy import deepcopy
-from enum import Enum
-from html import unescape
+from enum import IntEnum, auto
 from pathlib import Path
-from typing import Annotated, TypeVar
-from uuid import uuid4
+from typing import Any, Callable
 
-from pydantic import UUID4, AfterValidator, BaseModel, BeforeValidator, Field
-from pydantic.dataclasses import dataclass
+from loguru import logger
+from pydantic import UUID4
+from rich.console import Console
+from rich.table import Table
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from models import Deck, GameSettings, Player, WhiteCard
+from multiplayer import DEFAULT_WS_HOST, DEFAULT_WS_PORT, run_client, start_server
 
-DECKS_DIR = Path(__file__).parent / "decks"
+DECKS_DIR = Path(__file__).parent.parent / "decks"
 HAND_SIZE = 5
 
-
-class PlayerRole(str, Enum):
-    JUDGE = "judge"
-    PLAYER = "player"
-
-
-class Card(BaseModel):
-    text: Annotated[str, AfterValidator(unescape)]
-
-
-class WhiteCard(Card): ...
-
-
-class BlackCard(Card):
-    pick: int
-
-
-class CAHDrawingListEmpty(Exception): ...
-
-
-T = TypeVar("T")
-
-
-def random_subset_choice_with_tracking(
-    drawing_list: list[T],
-    tracking_list: list[T],
-    total: int = 1,
-) -> list[T]:
-    """Returns a subset of "total" length of random items from the drawing_list.
-
-    It updates both drawing_list and tracking_list so that the items are removed
-    from the drawing_list and added into the tracking_list.
-    """
-
-    if total > len(drawing_list):
-        raise CAHDrawingListEmpty
-
-    choices: list[T] = []
-
-    for _ in range(total):
-        choice = drawing_list.pop(random.randrange(len(drawing_list)))
-        tracking_list.append(choice)
-        choices.append(choice)
-
-    return choices
-
-
-class Deck(BaseModel):
-    name: str
-    code_name: str = Field(alias="codeName")
-    official: bool
-    black_cards: list[BlackCard] = Field(alias="blackCards", default_factory=list)
-    white_cards: Annotated[
-        list[WhiteCard],
-        BeforeValidator(lambda x: [WhiteCard(text=text) for text in x]),
-    ] = Field(alias="whiteCards", default_factory=list)
-
-    used_black_cards: list[BlackCard] = Field(default_factory=list)
-    used_white_cards: list[WhiteCard] = Field(default_factory=list)
-
-    def draw_black_cards(self, total: int = 1) -> list[BlackCard]:
-        """Draw a random black card."""
-
-        return random_subset_choice_with_tracking(
-            self.black_cards,
-            self.used_black_cards,
-            total,
-        )
-
-    def draw_white_cards(self, total: int = 1) -> list[WhiteCard]:
-        """Draw a random white card."""
-
-        return random_subset_choice_with_tracking(
-            self.white_cards,
-            self.used_white_cards,
-            total,
-        )
-
-
-@dataclass()
-class Player:
-    name: str
-    role: PlayerRole = PlayerRole.PLAYER
-    id: UUID4 = Field(default_factory=uuid4)
-    hand: list[WhiteCard] = Field(default_factory=list)
-    score: int = 0
+console = Console()
 
 
 def print_scoreboard(players: list[Player]) -> None:
-    print("-------------------------------------")
+    scoreboard = Table("Player", "Score", title="Scoreboard")
+
     for player in sorted(players, key=lambda x: x.score, reverse=True):
-        print(f"{player.name}: {player.score}")
-    print("-------------------------------------")
+        scoreboard.add_row(player.name, str(player.score))
+
+    console.print(scoreboard)
 
 
 def redraw_cards(
@@ -122,12 +40,118 @@ def redraw_cards(
         player_hand.extend(deck.draw_white_cards())
 
 
-def main():
-    deck = Deck.model_validate_json((DECKS_DIR / "CAH.json").read_bytes())
+class MultiplayerMode(IntEnum):
+    HOST = auto()
+    JOIN = auto()
 
-    logger.debug(f"{len(deck.white_cards)=} {len(deck.used_white_cards)=}")
-    logger.debug(f"{len(deck.black_cards)=} {len(deck.used_black_cards)=}")
 
+def get_user_input(
+    msg: str,
+    is_input_valid: Callable[[str], bool] = lambda x: bool(x.strip()),
+) -> Any:
+    choice = None
+
+    ready = False
+    while not ready:
+        try:
+            choice = input(msg)
+            if is_input_valid(choice):
+                ready = True
+            else:
+                logger.warning("Invalid input, please try again")
+        except KeyboardInterrupt:
+            sys.exit()
+
+        except Exception as e:
+            logger.error(e)
+
+    return choice
+
+
+def setup_game() -> GameSettings:
+    settings_dict: dict[str, Any] = {
+        "deck": Deck.model_validate_json((DECKS_DIR / "CAH.json").read_bytes()),
+    }
+
+    print("Please, configure the game settings:\n")
+    for key, field_info in GameSettings.model_fields.items():
+        if key in settings_dict:
+            # skip protected keys like deck
+            continue
+
+        type_caster = type(field_info.default)
+        choice = get_user_input(
+            f"{key} (default: {field_info.default})",
+            lambda x: x.strip() == "" or int(x) > 0,
+        )
+
+        if choice.strip() == "":
+            continue
+
+        settings_dict[key] = type_caster(choice)
+
+    game_settings = GameSettings.model_validate(settings_dict)
+
+    print("------------------------------")
+    print("Game settings:")
+    for key, value in game_settings.model_dump().items():
+        display_value = value
+        if key == "deck":
+            display_value = value["name"]
+
+        print(f"- {key.upper()}: {display_value}")
+
+    return game_settings
+
+
+async def main():
+    multiplayer_mode = MultiplayerMode(
+        int(
+            get_user_input(
+                f"""
+Please choose one:
+{"\n".join([f"{mode.value} - {mode.name}" for mode in MultiplayerMode])}
+Your choice: """,
+                lambda x: int(x) in MultiplayerMode,
+            )
+        )
+    )
+
+    logger.info(f"Player working as {multiplayer_mode.name}")
+
+    server_task: asyncio.Task | None = None
+
+    if multiplayer_mode is MultiplayerMode.HOST:
+        hostname, port = DEFAULT_WS_HOST, DEFAULT_WS_PORT
+
+        game_settings = setup_game()
+        server_task = asyncio.create_task(start_server(game_settings))
+
+        await asyncio.sleep(0.5)
+    else:
+        hostname: str = (
+            get_user_input(
+                f"Host IP (default: {DEFAULT_WS_HOST}): ",
+                lambda _: True,
+            ).strip()
+            or DEFAULT_WS_HOST
+        )
+        port = int(
+            get_user_input(
+                f"Host port (default: {DEFAULT_WS_PORT}): ",
+                lambda x: x.strip() == "" or int(x) > 0,
+            ).strip()
+            or DEFAULT_WS_PORT
+        )
+
+    await run_client(hostname, port)
+
+    if server_task:
+        await server_task
+
+    return
+
+    # OLD, TBD
     player_names = (
         "Yepes",
         "Mangel",
@@ -239,4 +263,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
